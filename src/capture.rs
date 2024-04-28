@@ -45,7 +45,7 @@ pub struct Progress<T> {
 /// An iterator that yields with a `None` every so often.
 pub struct YieldingIter<I> {
     /// When set, a time after which we should return `None`.
-    start: Option<std::time::Instant>,
+    start: Option<web_time::Instant>,
     after: std::time::Duration,
     iter: I,
 }
@@ -65,7 +65,7 @@ impl<I: Iterator> Iterator for YieldingIter<I> {
     type Item = I::Item;
     fn next(&mut self) -> Option<Self::Item> {
         if self.start.is_none() {
-            self.start = Some(std::time::Instant::now());
+            self.start = Some(web_time::Instant::now());
         }
         let start = self.start.as_ref().unwrap();
         if start.elapsed() > self.after {

@@ -46,11 +46,13 @@ abomonation = "0.7"
 abomonation_derive = "0.5"
 fnv="1.0.2"
 timely = {workspace = true}
+web-time = "1.1.0"
 
 [workspace.dependencies]
 #timely = { version = "0.12", default-features = false }
-timely = { git = "https://github.com/TimelyDataflow/timely-dataflow", default-features = false }
+#timely = { git = "https://github.com/TimelyDataflow/timely-dataflow", default-features = false }
 #timely = { path = "../timely-dataflow/timely/", default-features = false }
+timely = { git = "https://github.com/oli-w/timely-dataflow", default-features = false }
 
 [features]
 default = ["timely/getopts"]

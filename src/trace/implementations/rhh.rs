@@ -220,9 +220,11 @@ mod val_batch {
         // `signature` by this gives something in `[0, self.key_capacity)`. We could also
         // do powers of two and just make this really easy.
         fn divisor_for_capacity(capacity: usize) -> usize {
-            if capacity == 0 { 0 } 
+            // Max number of bits that `1usize` can be shifted before overflow
+            let max_bit_shift = std::mem::size_of::<usize>() * 8 - 1;
+            if capacity == 0 { 0 }
             else {
-                ((1 << 63) / capacity) << 1
+                ((1 << max_bit_shift) / capacity) << 1
             }
         }
     }
