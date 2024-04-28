@@ -141,7 +141,7 @@ where
     CF: Fn(Tr::TimeGat<'_>, &Tr::Time) -> bool + 'static,
     DOut: Clone+'static,
     ROut: Semigroup + 'static,
-    Y: Fn(std::time::Instant, usize) -> bool + 'static,
+    Y: Fn(web_time::Instant, usize) -> bool + 'static,
     I: IntoIterator<Item=(DOut, G::Timestamp, ROut)>,
     S: FnMut(&K, &V, Tr::Val<'_>, &G::Timestamp, &G::Timestamp, &R, &Tr::Diff)-> I + 'static,
 {
@@ -180,7 +180,7 @@ where
             // stopping at any point. We clean up all of the zeros in buffers that did any work,
             // and reactivate at the end if the yield function still says so.
             let mut yielded = false;
-            let timer = std::time::Instant::now();
+            let timer = web_time::Instant::now();
             let mut work = 0;
 
             // New entries to introduce to the stash after processing.

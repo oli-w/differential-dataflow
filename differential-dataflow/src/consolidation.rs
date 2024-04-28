@@ -441,7 +441,7 @@ mod tests {
             data.extend((0..LEN).map(|i| (i/4, 1, -2isize + ((i % 4) as isize))));
             data2.extend((0..LEN).map(|i| (i/4, 1, -2isize + ((i % 4) as isize))));
             data.sort_by(|x,y| x.0.cmp(&y.0));
-            let start = std::time::Instant::now();
+            let start = web_time::Instant::now();
             data.consolidate_into(&mut target);
             duration += start.elapsed();
 
@@ -459,7 +459,7 @@ mod tests {
             data.clear();
             data.extend((0..LEN).map(|i| (i/4, 1, -2isize + ((i % 4) as isize))));
             data.sort_by(|x,y| x.0.cmp(&y.0));
-            let start = std::time::Instant::now();
+            let start = web_time::Instant::now();
             consolidate_updates(&mut data);
             duration += start.elapsed();
         }
