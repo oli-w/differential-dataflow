@@ -15,7 +15,8 @@ where
     let mut logger = ::timely::logging::BatchLogger::new(writer);
     worker
         .log_register()
-        .insert::<DifferentialEvent,_>("differential/arrange", move |time, data| logger.publish_batch(time, data))
+        .map(|mut register| register.insert::<DifferentialEvent,_>("differential/arrange", move |time, data| logger.publish_batch(time, data)))
+        .unwrap_or_else(|| None)
 }
 
 /// Possible different differential events.

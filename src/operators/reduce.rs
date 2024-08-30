@@ -335,7 +335,9 @@ where
             let logger = {
                 let scope = trace.stream.scope();
                 let register = scope.log_register();
-                register.get::<crate::logging::DifferentialEvent>("differential/arrange")
+                register
+                    .map(|register| register.get::<crate::logging::DifferentialEvent>("differential/arrange"))
+                    .unwrap_or_else(|| None)
             };
 
             let activator = Some(trace.stream.scope().activator_for(&operator_info.address[..]));

@@ -430,7 +430,9 @@ where
         // Acquire a logger for arrange events.
         let logger = {
             let register = scope.log_register();
-            register.get::<crate::logging::DifferentialEvent>("differential/arrange")
+            register
+                .map(|logger| logger.get::<crate::logging::DifferentialEvent>("differential/arrange"))
+                .unwrap_or_else(|| None)
         };
 
         // Where we will deposit received updates, and from which we extract batches.
