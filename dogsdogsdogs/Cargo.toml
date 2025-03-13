@@ -12,6 +12,7 @@ timely = { workspace = true }
 differential-dataflow = { path = "../", default-features = false }
 serde = "1"
 serde_derive = "1"
+web-time = "1.1.0"
 
 [dev-dependencies]
 graph_map = "0.1"
