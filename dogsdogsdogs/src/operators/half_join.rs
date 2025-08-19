@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 use std::ops::Mul;
-use std::time::Instant;
+use web_time::Instant;
 
 use timely::container::{CapacityContainerBuilder, ContainerBuilder};
 use timely::dataflow::{Scope, ScopeParent, StreamCore};
@@ -159,7 +159,7 @@ where
     Tr: for<'a> TraceReader<KeyOwn = K>+Clone+'static,
     FF: Fn(&G::Timestamp, &mut Antichain<G::Timestamp>) + 'static,
     CF: Fn(Tr::TimeGat<'_>, &Tr::Time) -> bool + 'static,
-    Y: Fn(std::time::Instant, usize) -> bool + 'static,
+    Y: Fn(Instant, usize) -> bool + 'static,
     S: FnMut(&mut SessionFor<G, CB>, &K, &V, Tr::Val<'_>, &G::Timestamp, &R, &mut Vec<(G::Timestamp, Tr::Diff)>) + 'static,
     CB: ContainerBuilder,
 {
@@ -198,7 +198,7 @@ where
             // stopping at any point. We clean up all of the zeros in buffers that did any work,
             // and reactivate at the end if the yield function still says so.
             let mut yielded = false;
-            let timer = std::time::Instant::now();
+            let timer = Instant::now();
             let mut work = 0;
 
             // New entries to introduce to the stash after processing.

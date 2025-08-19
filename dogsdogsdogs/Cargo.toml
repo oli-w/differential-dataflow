@@ -11,9 +11,10 @@ homepage = "https://github.com/TimelyDataflow/differential-dataflow"
 repository = "https://github.com/TimelyDataflow/differential-dataflow.git"
 
 [dependencies]
-timely = { workspace = true }
-differential-dataflow = { workspace = true }
+timely = { version = "0.22", default-features = false }
+differential-dataflow = { version = "0.16.1", default-features = false }
 serde = { version = "1.0", features = ["derive"]}
+web-time = "1.1.0"
 
 [dev-dependencies]
 graph_map = "0.1"
