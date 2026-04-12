@@ -356,7 +356,50 @@ impl<CB: PushInto<D>, D> PushInto<D> for EffortBuilder<CB> {
 /// The "correctness" of this method depends heavily on the behavior of the supplied `result` function.
 ///
 /// [`AsCollection`]: crate::collection::AsCollection
-pub fn join_traces<G, T1, T2, L, CB>(arranged1: &Arranged<G,T1>, arranged2: &Arranged<G,T2>, mut result: L) -> StreamCore<G, CB::Container>
+pub fn join_traces<G, T1, T2, L, CB>(arranged1: &Arranged<G,T1>, arranged2: &Arranged<G,T2>, result: L) -> StreamCore<G, CB::Container>
+where
+    G: Scope<Timestamp=T1::Time>,
+    T1: TraceReader+Clone+'static,
+    T2: for<'a> TraceReader<Key<'a>=T1::Key<'a>, Time=T1::Time>+Clone+'static,
+    L: FnMut(T1::Key<'_>,T1::Val<'_>,T2::Val<'_>,&G::Timestamp,&T1::Diff,&T2::Diff,&mut JoinSession<T1::Time, CB, CB::Container>)+'static,
+    CB: ContainerBuilder + 'static,
+{
+    // Delegate to the bootstrap-aware variant with an empty frontier. When
+    // `bootstrap_frontier` is empty, the filter in the trace2 startup loop is a
+    // no-op, so behaviour is byte-identical to the original `join_traces`
+    // implementation.
+    use timely::progress::frontier::Antichain;
+    join_traces_with_bootstrap(arranged1, arranged2, Antichain::new(), result)
+}
+
+/// An equijoin variant that accepts a `bootstrap_frontier` describing the portion of
+/// `arranged2`'s trace that was populated via pre-built bootstrap batches (injected
+/// through `arrange_with_bootstrap` / `TraceWriter::insert`) rather than flowing through
+/// the input stream.
+///
+/// Differences from [`join_traces`]:
+///
+/// In the trace2 startup loop, any batch whose `upper()` is `<=` the caller-supplied
+/// `bootstrap_frontier` has its cursor **skipped** (i.e. not pushed into
+/// `batch2_cursors`), while `acknowledged2` is still advanced past it. This means the
+/// bootstrap × (anything) cross-join is NOT produced on the output stream at startup
+/// — the bootstrap data is kept in the trace only. At runtime, when `input1` delivers
+/// a delta, the deferred work is constructed via `cursor_through(acknowledged2)` which
+/// reads the full trace2 content (including bootstrap) so incremental deltas still
+/// join correctly against bootstrap entries.
+///
+/// Why only trace2: upstream's trace1 startup loop does no cursor work — it only
+/// advances `acknowledged1`. trace2 is the loop that captures cursors and drives
+/// initial deferred work, so skipping bootstrap batches there is sufficient.
+///
+/// When `bootstrap_frontier.is_empty()`, the startup-loop filter is a no-op and this
+/// function is equivalent to [`join_traces`].
+pub fn join_traces_with_bootstrap<G, T1, T2, L, CB>(
+    arranged1: &Arranged<G, T1>,
+    arranged2: &Arranged<G, T2>,
+    bootstrap_frontier: timely::progress::frontier::Antichain<G::Timestamp>,
+    mut result: L,
+) -> StreamCore<G, CB::Container>
 where
     G: Scope<Timestamp=T1::Time>,
     T1: TraceReader+Clone+'static,
@@ -410,10 +453,27 @@ where
 
         // We capture batch2 cursors first and establish work second to avoid taking a `RefCell` lock
         // on both traces at the same time, as they could be the same trace and this would panic.
+        //
+        // Bootstrap change vs. upstream: any batch whose `upper` is `<=` the caller-supplied
+        // `bootstrap_frontier` is considered pre-injected bootstrap data. Its cursor is NOT
+        // pushed into `batch2_cursors` (so it does not drive initial deferred work), but
+        // `acknowledged2` is still advanced past it. At runtime, incremental deltas on
+        // `input1` read trace2 via `cursor_through(acknowledged2)` which includes the
+        // bootstrap range, so joins against bootstrap data still happen — just not
+        // emitted as a bootstrap × bootstrap cross-join at t=0.
         let mut batch2_cursors = Vec::new();
+        let bootstrap_filter_active = !bootstrap_frontier.is_empty();
         trace2.map_batches(|batch2| {
             acknowledged2.clone_from(batch2.upper());
-            batch2_cursors.push((batch2.cursor(), batch2.clone()));
+            // When `bootstrap_frontier` is empty, we treat the filter as disabled
+            // (i.e. behave as upstream). Note: in `Antichain::PartialOrder`,
+            // `x.less_equal(empty)` is vacuously true, so without this guard an
+            // empty frontier would incorrectly classify every batch as bootstrap.
+            let is_bootstrap_batch = bootstrap_filter_active
+                && PartialOrder::less_equal(batch2.upper(), &bootstrap_frontier);
+            if !is_bootstrap_batch {
+                batch2_cursors.push((batch2.cursor(), batch2.clone()));
+            }
         });
         // At this point, `ack2` should exactly equal `trace2.read_upper()`, as they are both determined by
         // iterating through batches and capturing the upper bound. This is a great moment to assert that

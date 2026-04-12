@@ -273,6 +273,67 @@ where
         )
             .as_collection()
     }
+
+    /// Bootstrap-aware variant of [`Arranged::join_core`].
+    ///
+    /// `bootstrap_frontier` describes the portion of `other`'s trace that was pre-populated
+    /// via pre-built bootstrap batches (e.g. through `arrange_with_bootstrap`). Batches of
+    /// `other` whose `upper` is `<=` `bootstrap_frontier` are skipped during the operator's
+    /// startup loop, so the bootstrap × bootstrap cross-join is NOT emitted on the output
+    /// stream at t=0. Runtime deltas still read the full trace (including bootstrap) via
+    /// `cursor_through`, so incremental joins against bootstrap data remain correct.
+    ///
+    /// When `bootstrap_frontier.is_empty()` the filter is disabled and this method behaves
+    /// identically to [`Arranged::join_core`].
+    pub fn join_core_with_bootstrap<T2, I, L>(
+        &self,
+        other: &Arranged<G, T2>,
+        bootstrap_frontier: timely::progress::frontier::Antichain<G::Timestamp>,
+        mut result: L,
+    ) -> Collection<G, I::Item, <T1::Diff as Multiply<T2::Diff>>::Output>
+    where
+        T2: for<'a> TraceReader<Key<'a> = T1::Key<'a>, Time = T1::Time> + Clone + 'static,
+        T1::Diff: Multiply<T2::Diff, Output: Semigroup + 'static>,
+        I: IntoIterator<Item: Data>,
+        L: FnMut(T1::Key<'_>, T1::Val<'_>, T2::Val<'_>) -> I + 'static,
+    {
+        let result_with_weights =
+            move |k: T1::Key<'_>, v1: T1::Val<'_>, v2: T2::Val<'_>, t: &G::Timestamp, r1: &T1::Diff, r2: &T2::Diff| {
+                let t = t.clone();
+                let r = (r1.clone()).multiply(r2);
+                result(k, v1, v2).into_iter().map(move |d| (d, t.clone(), r.clone()))
+            };
+        self.join_core_internal_unsafe_with_bootstrap(other, bootstrap_frontier, result_with_weights)
+    }
+
+    /// Bootstrap-aware variant of [`Arranged::join_core_internal_unsafe`]. See
+    /// [`Arranged::join_core_with_bootstrap`] for semantics of `bootstrap_frontier`.
+    pub fn join_core_internal_unsafe_with_bootstrap<T2, I, L, D, ROut>(
+        &self,
+        other: &Arranged<G, T2>,
+        bootstrap_frontier: timely::progress::frontier::Antichain<G::Timestamp>,
+        mut result: L,
+    ) -> Collection<G, D, ROut>
+    where
+        T2: for<'a> TraceReader<Key<'a> = T1::Key<'a>, Time = T1::Time> + Clone + 'static,
+        D: Data,
+        ROut: Semigroup + 'static,
+        I: IntoIterator<Item = (D, G::Timestamp, ROut)>,
+        L: FnMut(T1::Key<'_>, T1::Val<'_>, T2::Val<'_>, &G::Timestamp, &T1::Diff, &T2::Diff) -> I + 'static,
+    {
+        use crate::operators::join::join_traces_with_bootstrap;
+        join_traces_with_bootstrap::<_, _, _, _, crate::consolidation::ConsolidatingContainerBuilder<_>>(
+            self,
+            other,
+            bootstrap_frontier,
+            move |k, v1, v2, t, d1, d2, c| {
+                for datum in result(k, v1, v2, t, d1, d2) {
+                    c.give(datum);
+                }
+            },
+        )
+        .as_collection()
+    }
 }
 
 // Direct reduce implementations.
