@@ -310,7 +310,35 @@ where
 /// A key-wise reduction of values in an input trace.
 ///
 /// This method exists to provide reduce functionality without opinions about qualifying trace types.
-pub fn reduce_trace<G, T1, Bu, T2, L>(trace: &Arranged<G, T1>, name: &str, mut logic: L) -> Arranged<G, TraceAgent<T2>>
+pub fn reduce_trace<G, T1, Bu, T2, L>(trace: &Arranged<G, T1>, name: &str, logic: L) -> Arranged<G, TraceAgent<T2>>
+where
+    G: Scope<Timestamp=T1::Time>,
+    T1: TraceReader<KeyOwn: Ord> + Clone + 'static,
+    T2: for<'a> Trace<Key<'a>=T1::Key<'a>, KeyOwn=T1::KeyOwn, ValOwn: Data, Time=T1::Time> + 'static,
+    Bu: Builder<Time=T2::Time, Output = T2::Batch, Input: Container + PushInto<((T1::KeyOwn, T2::ValOwn), T2::Time, T2::Diff)>>,
+    L: FnMut(T1::Key<'_>, &[(T1::Val<'_>, T1::Diff)], &mut Vec<(T2::ValOwn,T2::Diff)>, &mut Vec<(T2::ValOwn, T2::Diff)>)+'static,
+{
+    reduce_trace_with_bootstrap::<G, T1, Bu, T2, L>(trace, Antichain::new(), None, name, logic)
+}
+
+/// A key-wise reduction of values in an input trace, with optional bootstrap output injection.
+///
+/// When `bootstrap_frontier` is non-empty and `bootstrap_output` is `Some`, the pre-built
+/// output batch is inserted directly into the output trace via `TraceWriter::insert()` before
+/// the operator begins processing. The operator's `upper_limit` and `lower_limit` are
+/// initialized to `bootstrap_frontier` so that the first activation is a no-op (the bootstrap
+/// batch already covers `[T::minimum(), bootstrap_frontier)`). Subsequent activations with
+/// incremental input correctly compute deltas relative to the pre-injected output.
+///
+/// When `bootstrap_frontier` is empty and `bootstrap_output` is `None`, the operator behaves
+/// identically to `reduce_trace`.
+pub fn reduce_trace_with_bootstrap<G, T1, Bu, T2, L>(
+    trace: &Arranged<G, T1>,
+    bootstrap_frontier: Antichain<G::Timestamp>,
+    bootstrap_output: Option<T2::Batch>,
+    name: &str,
+    mut logic: L,
+) -> Arranged<G, TraceAgent<T2>>
 where
     G: Scope<Timestamp=T1::Time>,
     T1: TraceReader<KeyOwn: Ord> + Clone + 'static,
@@ -341,11 +369,14 @@ where
 
             let (mut output_reader, mut output_writer) = TraceAgent::new(empty, operator_info, logger);
 
-            // let mut output_trace = TraceRc::make_from(agent).0;
+            // If a bootstrap output batch is provided, inject it directly into the output
+            // trace. The operator will skip re-evaluation for the range the batch covers.
+            if let Some(bootstrap_batch) = bootstrap_output {
+                output_writer.insert(bootstrap_batch, Some(<G::Timestamp as timely::progress::Timestamp>::minimum()));
+            }
+
             *result_trace = Some(output_reader.clone());
 
-            // let mut thinker1 = history_replay_prior::HistoryReplayer::<V, V2, G::Timestamp, R, R2>::new();
-            // let mut thinker = history_replay::HistoryReplayer::<V, V2, G::Timestamp, R, R2>::new();
             let mut new_interesting_times = Vec::<G::Timestamp>::new();
 
             // Our implementation maintains a list of outstanding `(key, time)` synthetic interesting times,
@@ -357,8 +388,16 @@ where
             let mut interesting_times = Vec::<G::Timestamp>::new();
 
             // Upper and lower frontiers for the pending input and output batches to process.
-            let mut upper_limit = Antichain::from_elem(<G::Timestamp as timely::progress::Timestamp>::minimum());
-            let mut lower_limit = Antichain::from_elem(<G::Timestamp as timely::progress::Timestamp>::minimum());
+            // When bootstrap_frontier is non-empty, skip the range [T::minimum(), bootstrap_frontier)
+            // because the pre-injected output already covers it. When empty, use the upstream
+            // default of T::minimum().
+            let effective_start = if bootstrap_frontier.is_empty() {
+                Antichain::from_elem(<G::Timestamp as timely::progress::Timestamp>::minimum())
+            } else {
+                bootstrap_frontier
+            };
+            let mut upper_limit = effective_start.clone();
+            let mut lower_limit = effective_start;
 
             // Output batches may need to be built piecemeal, and these temp storage help there.
             let mut output_upper = Antichain::from_elem(<G::Timestamp as timely::progress::Timestamp>::minimum());

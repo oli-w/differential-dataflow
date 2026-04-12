@@ -382,6 +382,63 @@ where
         use crate::operators::reduce::reduce_trace;
         reduce_trace::<_,_,Bu,_,_>(self, name, logic)
     }
+
+    /// Like `reduce_abelian`, but accepts a pre-built bootstrap output batch and frontier.
+    ///
+    /// When `bootstrap_frontier` is non-empty and `bootstrap_output` is `Some`, the output
+    /// batch is injected directly into the output trace and the operator skips re-evaluation
+    /// for `[T::minimum(), bootstrap_frontier)`. When both are empty/`None`, behaves
+    /// identically to `reduce_abelian`.
+    pub fn reduce_abelian_with_bootstrap<L, Bu, T2>(
+        &self,
+        bootstrap_frontier: Antichain<G::Timestamp>,
+        bootstrap_output: Option<T2::Batch>,
+        name: &str,
+        mut logic: L,
+    ) -> Arranged<G, TraceAgent<T2>>
+    where
+        T1: TraceReader<KeyOwn: Ord>,
+        T2: for<'a> Trace<
+            Key<'a>= T1::Key<'a>,
+            KeyOwn=T1::KeyOwn,
+            ValOwn: Data,
+            Time=T1::Time,
+            Diff: Abelian,
+        >+'static,
+        Bu: Builder<Time=G::Timestamp, Output = T2::Batch, Input: Container + PushInto<((T1::KeyOwn, T2::ValOwn), T2::Time, T2::Diff)>>,
+        L: FnMut(T1::Key<'_>, &[(T1::Val<'_>, T1::Diff)], &mut Vec<(T2::ValOwn, T2::Diff)>)+'static,
+    {
+        self.reduce_core_with_bootstrap::<_,Bu,T2>(bootstrap_frontier, bootstrap_output, name, move |key, input, output, change| {
+            if !input.is_empty() {
+                logic(key, input, change);
+            }
+            change.extend(output.drain(..).map(|(x,mut d)| { d.negate(); (x, d) }));
+            crate::consolidation::consolidate(change);
+        })
+    }
+
+    /// Like `reduce_core`, but accepts a pre-built bootstrap output batch and frontier.
+    pub fn reduce_core_with_bootstrap<L, Bu, T2>(
+        &self,
+        bootstrap_frontier: Antichain<G::Timestamp>,
+        bootstrap_output: Option<T2::Batch>,
+        name: &str,
+        logic: L,
+    ) -> Arranged<G, TraceAgent<T2>>
+    where
+        T1: TraceReader<KeyOwn: Ord>,
+        T2: for<'a> Trace<
+            Key<'a>=T1::Key<'a>,
+            KeyOwn=T1::KeyOwn,
+            ValOwn: Data,
+            Time=T1::Time,
+        >+'static,
+        Bu: Builder<Time=G::Timestamp, Output = T2::Batch, Input: Container + PushInto<((T1::KeyOwn, T2::ValOwn), T2::Time, T2::Diff)>>,
+        L: FnMut(T1::Key<'_>, &[(T1::Val<'_>, T1::Diff)], &mut Vec<(T2::ValOwn, T2::Diff)>, &mut Vec<(T2::ValOwn, T2::Diff)>)+'static,
+    {
+        use crate::operators::reduce::reduce_trace_with_bootstrap;
+        reduce_trace_with_bootstrap::<_,_,Bu,_,_>(self, bootstrap_frontier, bootstrap_output, name, logic)
+    }
 }
 
 
