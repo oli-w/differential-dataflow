@@ -383,16 +383,17 @@ where
         reduce_trace::<_,_,Bu,_,_>(self, name, logic)
     }
 
-    /// Like `reduce_abelian`, but accepts a pre-built bootstrap output batch and frontier.
+    /// Like `reduce_abelian`, but accepts pre-built bootstrap output batches and frontier.
     ///
-    /// When `bootstrap_frontier` is non-empty and `bootstrap_output` is `Some`, the output
-    /// batch is injected directly into the output trace and the operator skips re-evaluation
-    /// for `[T::minimum(), bootstrap_frontier)`. When both are empty/`None`, behaves
-    /// identically to `reduce_abelian`.
+    /// When `bootstrap_frontier` is non-empty and `bootstrap_output_batches` is non-empty,
+    /// the output batches are inserted directly into the output trace in lower-bound order
+    /// and the operator skips re-evaluation for `[T::minimum(), bootstrap_frontier)`. Each
+    /// batch's `lower` must equal the previous batch's `upper` (contiguous, non-overlapping).
+    /// When both are empty, behaves identically to `reduce_abelian`.
     pub fn reduce_abelian_with_bootstrap<L, Bu, T2>(
         &self,
         bootstrap_frontier: Antichain<G::Timestamp>,
-        bootstrap_output: Option<T2::Batch>,
+        bootstrap_output_batches: Vec<T2::Batch>,
         name: &str,
         mut logic: L,
     ) -> Arranged<G, TraceAgent<T2>>
@@ -408,7 +409,7 @@ where
         Bu: Builder<Time=G::Timestamp, Output = T2::Batch, Input: Container + PushInto<((T1::KeyOwn, T2::ValOwn), T2::Time, T2::Diff)>>,
         L: FnMut(T1::Key<'_>, &[(T1::Val<'_>, T1::Diff)], &mut Vec<(T2::ValOwn, T2::Diff)>)+'static,
     {
-        self.reduce_core_with_bootstrap::<_,Bu,T2>(bootstrap_frontier, bootstrap_output, name, move |key, input, output, change| {
+        self.reduce_core_with_bootstrap::<_,Bu,T2>(bootstrap_frontier, bootstrap_output_batches, name, move |key, input, output, change| {
             if !input.is_empty() {
                 logic(key, input, change);
             }
@@ -417,11 +418,11 @@ where
         })
     }
 
-    /// Like `reduce_core`, but accepts a pre-built bootstrap output batch and frontier.
+    /// Like `reduce_core`, but accepts pre-built bootstrap output batches and frontier.
     pub fn reduce_core_with_bootstrap<L, Bu, T2>(
         &self,
         bootstrap_frontier: Antichain<G::Timestamp>,
-        bootstrap_output: Option<T2::Batch>,
+        bootstrap_output_batches: Vec<T2::Batch>,
         name: &str,
         logic: L,
     ) -> Arranged<G, TraceAgent<T2>>
@@ -437,7 +438,7 @@ where
         L: FnMut(T1::Key<'_>, &[(T1::Val<'_>, T1::Diff)], &mut Vec<(T2::ValOwn, T2::Diff)>, &mut Vec<(T2::ValOwn, T2::Diff)>)+'static,
     {
         use crate::operators::reduce::reduce_trace_with_bootstrap;
-        reduce_trace_with_bootstrap::<_,_,Bu,_,_>(self, bootstrap_frontier, bootstrap_output, name, logic)
+        reduce_trace_with_bootstrap::<_,_,Bu,_,_>(self, bootstrap_frontier, bootstrap_output_batches, name, logic)
     }
 }
 

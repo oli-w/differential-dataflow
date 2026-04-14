@@ -318,24 +318,26 @@ where
     Bu: Builder<Time=T2::Time, Output = T2::Batch, Input: Container + PushInto<((T1::KeyOwn, T2::ValOwn), T2::Time, T2::Diff)>>,
     L: FnMut(T1::Key<'_>, &[(T1::Val<'_>, T1::Diff)], &mut Vec<(T2::ValOwn,T2::Diff)>, &mut Vec<(T2::ValOwn, T2::Diff)>)+'static,
 {
-    reduce_trace_with_bootstrap::<G, T1, Bu, T2, L>(trace, Antichain::new(), None, name, logic)
+    reduce_trace_with_bootstrap::<G, T1, Bu, T2, L>(trace, Antichain::new(), Vec::new(), name, logic)
 }
 
 /// A key-wise reduction of values in an input trace, with optional bootstrap output injection.
 ///
-/// When `bootstrap_frontier` is non-empty and `bootstrap_output` is `Some`, the pre-built
-/// output batch is inserted directly into the output trace via `TraceWriter::insert()` before
-/// the operator begins processing. The operator's `upper_limit` and `lower_limit` are
-/// initialized to `bootstrap_frontier` so that the first activation is a no-op (the bootstrap
-/// batch already covers `[T::minimum(), bootstrap_frontier)`). Subsequent activations with
+/// When `bootstrap_frontier` is non-empty and `bootstrap_output_batches` is non-empty, the
+/// pre-built output batches are inserted directly into the output trace via
+/// `TraceWriter::insert()` in lower-bound order before the operator begins processing. Each
+/// batch's `lower` must equal the previous batch's `upper` (contiguous, non-overlapping),
+/// starting at `T::minimum()`. The operator's `upper_limit` and `lower_limit` are initialized
+/// to `bootstrap_frontier` so that the first activation is a no-op (the pre-injected batches
+/// already cover `[T::minimum(), bootstrap_frontier)`). Subsequent activations with
 /// incremental input correctly compute deltas relative to the pre-injected output.
 ///
-/// When `bootstrap_frontier` is empty and `bootstrap_output` is `None`, the operator behaves
-/// identically to `reduce_trace`.
+/// When `bootstrap_frontier` is empty and `bootstrap_output_batches` is empty, the operator
+/// behaves identically to `reduce_trace`.
 pub fn reduce_trace_with_bootstrap<G, T1, Bu, T2, L>(
     trace: &Arranged<G, T1>,
     bootstrap_frontier: Antichain<G::Timestamp>,
-    bootstrap_output: Option<T2::Batch>,
+    bootstrap_output_batches: Vec<T2::Batch>,
     name: &str,
     mut logic: L,
 ) -> Arranged<G, TraceAgent<T2>>
@@ -369,10 +371,21 @@ where
 
             let (mut output_reader, mut output_writer) = TraceAgent::new(empty, operator_info, logger);
 
-            // If a bootstrap output batch is provided, inject it directly into the output
-            // trace. The operator will skip re-evaluation for the range the batch covers.
-            if let Some(bootstrap_batch) = bootstrap_output {
-                output_writer.insert(bootstrap_batch, Some(<G::Timestamp as timely::progress::Timestamp>::minimum()));
+            // If bootstrap output batches are provided, inject them directly into the output
+            // trace in order. The operator will skip re-evaluation for the combined range
+            // they cover. Each batch's lower must equal the previous batch's upper.
+            {
+                let mut running_upper = Antichain::from_elem(<G::Timestamp as timely::progress::Timestamp>::minimum());
+                for bootstrap_batch in bootstrap_output_batches {
+                    assert!(
+                        bootstrap_batch.lower() == &running_upper,
+                        "bootstrap batch lower {:?} must equal running upper {:?}",
+                        bootstrap_batch.lower(),
+                        running_upper,
+                    );
+                    running_upper = bootstrap_batch.upper().clone();
+                    output_writer.insert(bootstrap_batch, Some(<G::Timestamp as timely::progress::Timestamp>::minimum()));
+                }
             }
 
             *result_trace = Some(output_reader.clone());
