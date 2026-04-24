@@ -374,6 +374,11 @@ where
             // If bootstrap output batches are provided, inject them directly into the output
             // trace in order. The operator will skip re-evaluation for the combined range
             // they cover. Each batch's lower must equal the previous batch's upper.
+            // Empty-range batches (`lower == upper`) are skipped for insertion but still
+            // contribute their upper to the running frontier — this matches
+            // `arrange_with_bootstrap`'s behaviour and lets callers pass a single sealed
+            // empty-range batch as a "no bootstrap data" sentinel without tripping
+            // `TraceWriter::insert`'s `lower != upper` assertion.
             {
                 let mut running_upper = Antichain::from_elem(<G::Timestamp as timely::progress::Timestamp>::minimum());
                 for bootstrap_batch in bootstrap_output_batches {
@@ -384,7 +389,9 @@ where
                         running_upper,
                     );
                     running_upper = bootstrap_batch.upper().clone();
-                    output_writer.insert(bootstrap_batch, Some(<G::Timestamp as timely::progress::Timestamp>::minimum()));
+                    if bootstrap_batch.lower() != bootstrap_batch.upper() {
+                        output_writer.insert(bootstrap_batch, Some(<G::Timestamp as timely::progress::Timestamp>::minimum()));
+                    }
                 }
             }
 
