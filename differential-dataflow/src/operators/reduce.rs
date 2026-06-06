@@ -379,8 +379,8 @@ where
             // `arrange_with_bootstrap`'s behaviour and lets callers pass a single sealed
             // empty-range batch as a "no bootstrap data" sentinel without tripping
             // `TraceWriter::insert`'s `lower != upper` assertion.
-            {
-                let mut running_upper = Antichain::from_elem(<G::Timestamp as timely::progress::Timestamp>::minimum());
+            let bootstrap_output_upper = {
+                let mut running_upper = Antichain::from_elem(<G::Timestamp as Timestamp>::minimum());
                 for bootstrap_batch in bootstrap_output_batches {
                     assert!(
                         bootstrap_batch.lower() == &running_upper,
@@ -390,10 +390,11 @@ where
                     );
                     running_upper = bootstrap_batch.upper().clone();
                     if bootstrap_batch.lower() != bootstrap_batch.upper() {
-                        output_writer.insert(bootstrap_batch, Some(<G::Timestamp as timely::progress::Timestamp>::minimum()));
+                        output_writer.insert(bootstrap_batch, Some(<G::Timestamp as Timestamp>::minimum()));
                     }
                 }
-            }
+                running_upper
+            };
 
             *result_trace = Some(output_reader.clone());
 
@@ -407,21 +408,28 @@ where
             // buffers and logic for computing per-key interesting times "efficiently".
             let mut interesting_times = Vec::<G::Timestamp>::new();
 
-            // Upper and lower frontiers for the pending input and output batches to process.
-            // When bootstrap_frontier is non-empty, skip the range [T::minimum(), bootstrap_frontier)
-            // because the pre-injected output already covers it. When empty, use the upstream
-            // default of T::minimum().
+            // The effective start for the reduce must be at least as far as:
+            // 1. bootstrap_frontier — the caller's declared skip range
+            // 2. bootstrap_output_upper — where the output writer actually is
+            // Taking the join (element-wise max) ensures the reduce never tries
+            // to produce output behind the writer's position.
             let effective_start = if bootstrap_frontier.is_empty() {
-                Antichain::from_elem(<G::Timestamp as timely::progress::Timestamp>::minimum())
+                Antichain::from_elem(<G::Timestamp as Timestamp>::minimum())
             } else {
-                bootstrap_frontier
+                bootstrap_frontier.join(&bootstrap_output_upper)
             };
+            // If the bootstrap frontier is ahead of where the output batches
+            // ended (e.g. adhoc bootstrap where output batches are sealed at
+            // committed(1) but the frontier is committed(committed_system)),
+            // seal the output writer up to the effective start so it doesn't
+            // have a gap.
+            output_writer.seal(effective_start.clone());
             let mut upper_limit = effective_start.clone();
             let mut lower_limit = effective_start;
 
             // Output batches may need to be built piecemeal, and these temp storage help there.
-            let mut output_upper = Antichain::from_elem(<G::Timestamp as timely::progress::Timestamp>::minimum());
-            let mut output_lower = Antichain::from_elem(<G::Timestamp as timely::progress::Timestamp>::minimum());
+            let mut output_upper = Antichain::from_elem(<G::Timestamp as Timestamp>::minimum());
+            let mut output_lower = Antichain::from_elem(<G::Timestamp as Timestamp>::minimum());
 
             let id = trace.stream.scope().index();
 
