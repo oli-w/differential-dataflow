@@ -522,7 +522,11 @@ where
                             if !batch1.is_empty() {
                                 // It is safe to ask for `ack2` as we validated that it was at least `get_physical_compaction()`
                                 // at start-up, and have held back physical compaction ever since.
-                                let (trace2_cursor, trace2_storage) = trace2.cursor_through(acknowledged2.borrow()).unwrap();
+                                let (trace2_cursor, trace2_storage) = trace2.cursor_through(acknowledged2.borrow())
+                                    .unwrap_or_else(|| {
+                                        panic!("[join input1] cursor_through(acknowledged2={:?}) returned None; batch1.lower={:?}, batch1.upper={:?}",
+                                            acknowledged2, batch1.lower(), batch1.upper())
+                                    });
                                 let batch1_cursor = batch1.cursor();
                                 todo1.push_back(Deferred::new(trace2_cursor, trace2_storage, batch1_cursor, batch1.clone(), capability.clone()));
                             }
@@ -549,7 +553,11 @@ where
                             if !batch2.is_empty() {
                                 // It is safe to ask for `ack1` as we validated that it was at least `get_physical_compaction()`
                                 // at start-up, and have held back physical compaction ever since.
-                                let (trace1_cursor, trace1_storage) = trace1.cursor_through(acknowledged1.borrow()).unwrap();
+                                let (trace1_cursor, trace1_storage) = trace1.cursor_through(acknowledged1.borrow())
+                                    .unwrap_or_else(|| {
+                                        panic!("[join input2] cursor_through(acknowledged1={:?}) returned None; batch2.lower={:?}, batch2.upper={:?}",
+                                            acknowledged1, batch2.lower(), batch2.upper())
+                                    });
                                 let batch2_cursor = batch2.cursor();
                                 todo2.push_back(Deferred::new(trace1_cursor, trace1_storage, batch2_cursor, batch2.clone(), capability.clone()));
                             }

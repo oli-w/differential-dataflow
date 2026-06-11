@@ -184,15 +184,26 @@ impl<B: Batch+Clone+'static> TraceReader for Spine<B> {
                 // requires some-but-not-all of the updates in the batch. We can
                 // determine this from `upper` and the lower and upper bounds of
                 // the batch itself.
-                //
-                // TODO: It is not clear if this is the 100% correct logic, due
-                // to the possible non-total-orderedness of the frontiers.
 
                 let include_lower = PartialOrder::less_equal(&batch.lower().borrow(), &upper);
                 let include_upper = PartialOrder::less_equal(&batch.upper().borrow(), &upper);
 
                 if include_lower != include_upper && upper != batch.lower().borrow() {
-                    panic!("`cursor_through`: `upper` straddles batch");
+                    // With partially-ordered timestamps, `batch.lower <= upper`
+                    // (include_lower=true) does not guarantee the batch contains
+                    // data strictly before `upper`. Check whether any element of
+                    // batch.lower is strictly less than any element of upper. If
+                    // not, the batch's data starts at or after the cursor frontier
+                    // and can be safely excluded.
+                    let batch_has_data_before_upper = batch.lower().borrow().iter().any(|batch_lower_element| {
+                        upper.iter().any(|upper_element| batch_lower_element.less_than(upper_element))
+                    });
+                    if batch_has_data_before_upper {
+                        panic!("`cursor_through`: `upper` straddles batch: upper={:?}, batch.lower={:?}, batch.upper={:?}",
+                            upper.to_owned(), batch.lower(), batch.upper());
+                    }
+                    // No data in this batch is before upper — safe to exclude.
+                    continue;
                 }
 
                 // include pending batches
