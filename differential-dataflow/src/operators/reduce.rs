@@ -416,13 +416,21 @@ where
             let effective_start = if bootstrap_frontier.is_empty() {
                 Antichain::from_elem(<G::Timestamp as Timestamp>::minimum())
             } else {
-                bootstrap_frontier.join(&bootstrap_output_upper)
+                let target = bootstrap_frontier.join(&bootstrap_output_upper);
+                // Snap the target down to the largest source trace batch boundary
+                // that is <= target. This guarantees cursor_through won't straddle
+                // any batch, even when batch boundaries are multi-element antichains
+                // (e.g. from iterative fixed-point convergence in L1 scope).
+                let mut snapped = bootstrap_output_upper.clone();
+                source_trace.map_batches(|batch| {
+                    if PartialOrder::less_equal(batch.upper(), &target) &&
+                       PartialOrder::less_equal(&snapped, batch.upper()) {
+                        snapped = batch.upper().clone();
+                    }
+                });
+                snapped
             };
-            // If the bootstrap frontier is ahead of where the output batches
-            // ended (e.g. adhoc bootstrap where output batches are sealed at
-            // committed(1) but the frontier is committed(committed_system)),
-            // seal the output writer up to the effective start so it doesn't
-            // have a gap.
+
             output_writer.seal(effective_start.clone());
             let mut upper_limit = effective_start.clone();
             let mut lower_limit = effective_start;
