@@ -416,19 +416,7 @@ where
             let effective_start = if bootstrap_frontier.is_empty() {
                 Antichain::from_elem(<G::Timestamp as Timestamp>::minimum())
             } else {
-                let target = bootstrap_frontier.join(&bootstrap_output_upper);
-                // Snap the target down to the largest source trace batch boundary
-                // that is <= target. This guarantees cursor_through won't straddle
-                // any batch, even when batch boundaries are multi-element antichains
-                // (e.g. from iterative fixed-point convergence in L1 scope).
-                let mut snapped = bootstrap_output_upper.clone();
-                source_trace.map_batches(|batch| {
-                    if PartialOrder::less_equal(batch.upper(), &target) &&
-                       PartialOrder::less_equal(&snapped, batch.upper()) {
-                        snapped = batch.upper().clone();
-                    }
-                });
-                snapped
+                bootstrap_frontier.join(&bootstrap_output_upper)
             };
 
             output_writer.seal(effective_start.clone());

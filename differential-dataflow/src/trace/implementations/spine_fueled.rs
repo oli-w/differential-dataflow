@@ -70,13 +70,66 @@
 
 
 use crate::logging::Logger;
-use crate::trace::{Batch, BatchReader, Trace, TraceReader, ExertionLogic};
+use crate::trace::{Batch, BatchReader, Description, Trace, TraceReader, ExertionLogic};
 use crate::trace::cursor::CursorList;
 use crate::trace::Merger;
 
 use ::timely::dataflow::operators::generic::OperatorInfo;
 use ::timely::progress::{Antichain, frontier::AntichainRef};
 use ::timely::order::PartialOrder;
+
+/// Determines whether a batch should be included in a `cursor_through(cursor_upper)` result.
+///
+/// Returns `true` if the batch is entirely before the cursor frontier (all data at times
+/// not yet finalized by `cursor_upper`). Returns `false` if the batch is entirely at or
+/// past the cursor frontier. Panics if the batch straddles the frontier — the cursor
+/// cannot partially include a batch.
+///
+/// Three-way decision:
+///
+/// 1. **Include**: `batch.upper <= cursor_upper` — every time in `[batch.lower, batch.upper)`
+///    is strictly before some element of `cursor_upper`. Proof: for any data time `t` with
+///    `NOT batch.upper.less_equal(t)`, suppose `cursor_upper.less_equal(t)` (some `u <= t`).
+///    Since `batch.upper <= cursor_upper`, some `bu <= u`, so `bu <= t`, contradicting
+///    `NOT batch.upper.less_equal(t)`.
+///
+/// 2. **Exclude**: `cursor_upper <= batch.lower` — every time in the batch is at or past the
+///    cursor frontier. Proof: for any data time `t` with some `l <= t` (where `l ∈ batch.lower`),
+///    since `cursor_upper <= batch.lower`, some `u <= l`, so `u <= t` by transitivity.
+///
+/// 3. **Panic**: neither condition holds — the batch boundary and cursor frontier are in an
+///    ambiguous relationship. With partially-ordered timestamps, this means the cursor frontier
+///    does not align with a batch boundary, which is a caller bug.
+pub fn include_batch<T: PartialOrder + Clone + std::fmt::Debug>(
+    batch_description: &Description<T>,
+    cursor_upper: AntichainRef<T>,
+) -> bool {
+    let batch_entirely_before_cursor = PartialOrder::less_equal(
+        &batch_description.upper().borrow(),
+        &cursor_upper,
+    );
+    if batch_entirely_before_cursor {
+        return true;
+    }
+
+    let batch_entirely_after_cursor = PartialOrder::less_equal(
+        &cursor_upper,
+        &batch_description.lower().borrow(),
+    );
+    if batch_entirely_after_cursor {
+        return false;
+    }
+
+    panic!(
+        "`cursor_through`: `cursor_upper` does not align with batch boundary \
+         (batch has data both before and after the cursor frontier, or the \
+         relationship is ambiguous under the partial order). \
+         cursor_upper={:?}, batch.lower={:?}, batch.upper={:?}",
+        cursor_upper.to_owned(),
+        batch_description.lower(),
+        batch_description.upper(),
+    );
+}
 
 /// An append-only collection of update tuples.
 ///
@@ -177,37 +230,8 @@ impl<B: Batch+Clone+'static> TraceReader for Spine<B> {
         }
 
         for batch in self.pending.iter() {
-
             if !batch.is_empty() {
-
-                // For a non-empty `batch`, it is a catastrophic error if `upper`
-                // requires some-but-not-all of the updates in the batch. We can
-                // determine this from `upper` and the lower and upper bounds of
-                // the batch itself.
-
-                let include_lower = PartialOrder::less_equal(&batch.lower().borrow(), &upper);
-                let include_upper = PartialOrder::less_equal(&batch.upper().borrow(), &upper);
-
-                if include_lower != include_upper && upper != batch.lower().borrow() {
-                    // With partially-ordered timestamps, `batch.lower <= upper`
-                    // (include_lower=true) does not guarantee the batch contains
-                    // data strictly before `upper`. Check whether any element of
-                    // batch.lower is strictly less than any element of upper. If
-                    // not, the batch's data starts at or after the cursor frontier
-                    // and can be safely excluded.
-                    let batch_has_data_before_upper = batch.lower().borrow().iter().any(|batch_lower_element| {
-                        upper.iter().any(|upper_element| batch_lower_element.less_than(upper_element))
-                    });
-                    if batch_has_data_before_upper {
-                        panic!("`cursor_through`: `upper` straddles batch: upper={:?}, batch.lower={:?}, batch.upper={:?}",
-                            upper.to_owned(), batch.lower(), batch.upper());
-                    }
-                    // No data in this batch is before upper — safe to exclude.
-                    continue;
-                }
-
-                // include pending batches
-                if include_upper {
+                if include_batch(batch.description(), upper) {
                     cursors.push(batch.cursor());
                     storage.push(batch.clone());
                 }
@@ -905,5 +929,257 @@ impl<B: Batch> MergeVariant<B> {
         else {
             *self = variant;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::include_batch;
+    use crate::trace::Description;
+    use timely::progress::Antichain;
+    use timely::order::Product;
+
+    fn desc<T: Clone>(lower: Antichain<T>, upper: Antichain<T>) -> Description<T>
+    where
+        T: timely::progress::Timestamp,
+    {
+        Description::new(lower, upper, Antichain::from_elem(T::minimum()))
+    }
+
+    // ---------------------------------------------------------------
+    // Total order (usize) — baseline sanity checks
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn total_order_batch_entirely_before_cursor() {
+        // batch=[0, 5), cursor=10 → include
+        let description = desc(Antichain::from_elem(0usize), Antichain::from_elem(5));
+        assert!(include_batch(&description, Antichain::from_elem(10).borrow()));
+    }
+
+    #[test]
+    fn total_order_batch_upper_equals_cursor() {
+        // batch=[0, 5), cursor=5 → include (batch.upper == cursor)
+        let description = desc(Antichain::from_elem(0usize), Antichain::from_elem(5));
+        assert!(include_batch(&description, Antichain::from_elem(5).borrow()));
+    }
+
+    #[test]
+    fn total_order_batch_entirely_after_cursor() {
+        // batch=[10, 15), cursor=5 → exclude
+        let description = desc(Antichain::from_elem(10usize), Antichain::from_elem(15));
+        assert!(!include_batch(&description, Antichain::from_elem(5).borrow()));
+    }
+
+    #[test]
+    fn total_order_batch_lower_equals_cursor() {
+        // batch=[5, 10), cursor=5 → exclude (batch starts at cursor)
+        let description = desc(Antichain::from_elem(5usize), Antichain::from_elem(10));
+        assert!(!include_batch(&description, Antichain::from_elem(5).borrow()));
+    }
+
+    #[test]
+    #[should_panic(expected = "cursor_upper")]
+    fn total_order_straddle_panics() {
+        // batch=[3, 8), cursor=5 → straddle (data at 3,4 is before cursor=5)
+        let description = desc(Antichain::from_elem(3usize), Antichain::from_elem(8));
+        include_batch(&description, Antichain::from_elem(5).borrow());
+    }
+
+    // ---------------------------------------------------------------
+    // Partial order: Product<usize, usize>
+    // ---------------------------------------------------------------
+
+    type P = Product<usize, usize>;
+
+    fn p(outer: usize, inner: usize) -> P {
+        Product::new(outer, inner)
+    }
+
+    #[test]
+    fn partial_order_batch_entirely_before_cursor() {
+        // batch.upper=(2,2) <= cursor=(3,3) → include
+        let description = desc(Antichain::from_elem(p(0, 0)), Antichain::from_elem(p(2, 2)));
+        assert!(include_batch(&description, Antichain::from_elem(p(3, 3)).borrow()));
+    }
+
+    #[test]
+    fn partial_order_batch_upper_equals_cursor() {
+        // batch.upper=(3,3) <= cursor=(3,3) → include
+        let description = desc(Antichain::from_elem(p(1, 1)), Antichain::from_elem(p(3, 3)));
+        assert!(include_batch(&description, Antichain::from_elem(p(3, 3)).borrow()));
+    }
+
+    #[test]
+    fn partial_order_batch_entirely_after_cursor() {
+        // batch.lower=(5,5), cursor=(3,3) → cursor <= batch.lower → exclude
+        let description = desc(Antichain::from_elem(p(5, 5)), Antichain::from_elem(p(8, 8)));
+        assert!(!include_batch(&description, Antichain::from_elem(p(3, 3)).borrow()));
+    }
+
+    #[test]
+    fn partial_order_batch_lower_equals_cursor() {
+        // batch.lower=(3,3) == cursor=(3,3) → cursor <= batch.lower → exclude
+        let description = desc(Antichain::from_elem(p(3, 3)), Antichain::from_elem(p(5, 5)));
+        assert!(!include_batch(&description, Antichain::from_elem(p(3, 3)).borrow()));
+    }
+
+    #[test]
+    #[should_panic(expected = "cursor_upper")]
+    fn partial_order_straddle_panics() {
+        // batch=[p(1,1), p(5,5)), cursor=p(3,3) → straddle
+        let description = desc(Antichain::from_elem(p(1, 1)), Antichain::from_elem(p(5, 5)));
+        include_batch(&description, Antichain::from_elem(p(3, 3)).borrow());
+    }
+
+    // ---------------------------------------------------------------
+    // Key scenario: incomparable batch.lower with cursor (false straddle fix)
+    //
+    // With partially-ordered timestamps, batch.lower can be incomparable
+    // with cursor_upper. If batch.upper <= cursor_upper, the batch is
+    // still entirely before the cursor — include it.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn partial_order_incomparable_lower_but_upper_before_cursor_includes() {
+        // batch.lower = (1,5) — incomparable with cursor (3,3): 1<3 but 5>3
+        // batch.upper = (2,2) <= cursor (3,3) → include
+        let description = desc(Antichain::from_elem(p(1, 5)), Antichain::from_elem(p(2, 2)));
+        assert!(include_batch(&description, Antichain::from_elem(p(3, 3)).borrow()));
+    }
+
+    #[test]
+    fn partial_order_incomparable_lower_and_upper_not_before_cursor_panics() {
+        // batch.lower = (1,5) — incomparable with cursor (3,3)
+        // batch.upper = (5,5) — NOT <= cursor (3,3)
+        // cursor (3,3) NOT <= batch.lower (1,5): 3<=1? no
+        // → ambiguous, should panic
+        let description = desc(Antichain::from_elem(p(1, 5)), Antichain::from_elem(p(5, 5)));
+        let result = std::panic::catch_unwind(|| {
+            include_batch(&description, Antichain::from_elem(p(3, 3)).borrow())
+        });
+        assert!(result.is_err(), "should panic on ambiguous batch/cursor relationship");
+    }
+
+    // ---------------------------------------------------------------
+    // Multi-element antichains
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn multi_element_cursor_batch_before() {
+        // cursor = {(2,5), (5,2)} — two-element antichain
+        // batch.upper = (2,2) <= cursor? For (2,5): (2,2)<=(2,5)? yes. For (5,2): (2,2)<=(5,2)? yes.
+        // → include
+        let cursor = Antichain::from(vec![p(2, 5), p(5, 2)]);
+        let description = desc(Antichain::from_elem(p(0, 0)), Antichain::from_elem(p(2, 2)));
+        assert!(include_batch(&description, cursor.borrow()));
+    }
+
+    #[test]
+    fn multi_element_cursor_batch_after() {
+        // cursor = {(2,5), (5,2)}
+        // batch.lower = {(3,6), (6,3)}
+        // cursor <= batch.lower?
+        //   For (3,6): is (2,5)<=(3,6)? 2<=3,5<=6 yes. ✓
+        //   For (6,3): is (5,2)<=(6,3)? 5<=6,2<=3 yes. ✓
+        // → exclude
+        let cursor = Antichain::from(vec![p(2, 5), p(5, 2)]);
+        let description = desc(
+            Antichain::from(vec![p(3, 6), p(6, 3)]),
+            Antichain::from(vec![p(10, 10)]),
+        );
+        assert!(!include_batch(&description, cursor.borrow()));
+    }
+
+    #[test]
+    fn multi_element_batch_lower_cursor_at_same_frontier() {
+        // batch.lower = {(3,0), (0,3)}, cursor = {(3,0), (0,3)} — equal
+        // cursor <= batch.lower: for each l, some u <= l. Since they're equal, yes.
+        // → exclude
+        let frontier = Antichain::from(vec![p(3, 0), p(0, 3)]);
+        let description = desc(frontier.clone(), Antichain::from_elem(p(5, 5)));
+        assert!(!include_batch(&description, frontier.borrow()));
+    }
+
+    #[test]
+    #[should_panic(expected = "cursor_upper")]
+    fn multi_element_straddle_panics() {
+        // batch.lower = {(1,1)}, batch.upper = {(5,5)}
+        // cursor = {(2,4), (4,2)} — straddles the batch
+        // batch.upper <= cursor? (5,5)<=(2,4)? no. (5,5)<=(4,2)? no. → NO
+        // cursor <= batch.lower? (2,4)<=(1,1)? no. → NO
+        // → panic
+        let cursor = Antichain::from(vec![p(2, 4), p(4, 2)]);
+        let description = desc(Antichain::from_elem(p(1, 1)), Antichain::from_elem(p(5, 5)));
+        include_batch(&description, cursor.borrow());
+    }
+
+    // ---------------------------------------------------------------
+    // Product timestamp edge case: iteration boundary advancement
+    //
+    // In iterative scopes, the frontier can advance from
+    // {(outer, MAX)} to {(outer+1, 0)}. These are incomparable in
+    // the Product order: outer advances but inner "wraps" to 0.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn product_iteration_wrap_batch_before_cursor() {
+        // batch = [(2, MAX), (3, 0)), cursor = (3, 0)
+        // batch.upper = (3,0) <= cursor (3,0)? yes → include
+        let description = desc(
+            Antichain::from_elem(p(2, usize::MAX)),
+            Antichain::from_elem(p(3, 0)),
+        );
+        assert!(include_batch(&description, Antichain::from_elem(p(3, 0)).borrow()));
+    }
+
+    #[test]
+    fn product_iteration_wrap_batch_after_cursor() {
+        // batch.lower = (3, 0), cursor = (2, MAX)
+        // cursor <= batch.lower? (2,MAX) <= (3,0)? 2<=3 yes, MAX<=0 no → NO
+        // batch.upper <= cursor? assume (4,0) <= (2,MAX)? 4<=2 no → NO
+        // → panic (these are incomparable, can't cleanly decide)
+        let description = desc(
+            Antichain::from_elem(p(3, 0)),
+            Antichain::from_elem(p(4, 0)),
+        );
+        let result = std::panic::catch_unwind(|| {
+            include_batch(&description, Antichain::from_elem(p(2, usize::MAX)).borrow())
+        });
+        assert!(result.is_err(), "should panic on incomparable iteration boundary");
+    }
+
+    #[test]
+    fn product_iteration_wrap_cursor_at_next_outer() {
+        // batch = [(2, MAX), (3, 0)), cursor = (4, 0)
+        // batch.upper = (3,0) <= cursor (4,0)? 3<=4 yes, 0<=0 yes → include
+        let description = desc(
+            Antichain::from_elem(p(2, usize::MAX)),
+            Antichain::from_elem(p(3, 0)),
+        );
+        assert!(include_batch(&description, Antichain::from_elem(p(4, 0)).borrow()));
+    }
+
+    // ---------------------------------------------------------------
+    // Edge case: empty frontier (signals trace completion)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn empty_cursor_includes_all_batches() {
+        // cursor = {} (empty antichain = top of partial order, "all times finalized")
+        // batch.upper {5} <= cursor {} → vacuously true (nothing to check) → include
+        let description = desc(Antichain::from_elem(0usize), Antichain::from_elem(5));
+        assert!(include_batch(&description, Antichain::new().borrow()));
+    }
+
+    #[test]
+    #[should_panic(expected = "cursor_upper")]
+    fn batch_with_empty_upper_straddles_nonempty_cursor() {
+        // batch.upper = {} (empty = top of partial order, batch covers all times)
+        // {} <= cursor {5}? For each element 5 in cursor, need element in {} <= 5. None → false
+        // cursor {5} <= batch.lower {0}? 5 <= 0? false → false
+        // → straddle panic (batch covers all times, can't cleanly cut at 5)
+        let description = desc::<usize>(Antichain::from_elem(0), Antichain::new());
+        include_batch(&description, Antichain::from_elem(5).borrow());
     }
 }
