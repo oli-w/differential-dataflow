@@ -165,8 +165,8 @@ impl<C: Cursor> Cursor for CursorList<C> {
     }
     #[inline]
     fn seek_val(&mut self, storage: &Vec<C::Storage>, val: Self::Val<'_>) {
-        for (cursor, storage) in self.cursors.iter_mut().zip(storage) {
-            cursor.seek_val(storage, val);
+        for &index in self.min_key.iter() {
+            self.cursors[index].seek_val(&storage[index], val);
         }
         self.minimize_vals(storage);
     }
