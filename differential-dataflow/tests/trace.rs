@@ -57,3 +57,33 @@ fn test_trace() {
     let vec_4 = cursor4.to_vec(&storage4, |k| k.clone(), |v| v.clone());
     assert_eq!(vec_4, vec_3);
 }
+
+/// Regression: `CursorList::seek_val` must only dispatch to sub-cursors positioned on a valid key.
+///
+/// After `seek_key(2)` the sub-cursor for the second batch (which lacks key 2) is past its end;
+/// dispatching `seek_val` to it indexed out of range.
+#[test]
+fn seek_val_with_multiple_batches_does_not_panic() {
+    let op_info = OperatorInfo::new(0, 0, [].into());
+    let mut trace = IntegerTrace::new(op_info, None, None);
+
+    let mut batcher = ValBatcher::<u64,u64,usize,i64>::new(None, 0);
+    batcher.push_into(vec![
+        ((1, 10), 0, 1),
+        ((2, 20), 0, 1),
+        ((1, 30), 1, 1),
+    ]);
+    for upper in [1, 2] {
+        let (mut chain, description) = batcher.seal(Antichain::from_elem(upper));
+        trace.insert(IntegerBuilder::seal(&mut chain, description));
+    }
+
+    let (mut cursor, storage) = trace.cursor();
+    cursor.seek_key(&storage, &2);
+    assert!(cursor.key_valid(&storage));
+    assert_eq!(*cursor.key(&storage), 2);
+
+    cursor.seek_val(&storage, &20);
+    assert!(cursor.val_valid(&storage));
+    assert_eq!(*cursor.val(&storage), 20);
+}

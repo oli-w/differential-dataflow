@@ -135,7 +135,7 @@ where
     <BatchCursor<Tr> as Cursor>::KeyContainer: BatchContainer<Owned=K>,
     FF: Fn(&Tr::Time, &mut Antichain<Tr::Time>) + 'static,
     CF: Fn(BatchTimeGat<'_, Tr>, &Tr::Time) -> bool + 'static,
-    Y: Fn(std::time::Instant, usize) -> bool + 'static,
+    Y: Fn(web_time::Instant, usize) -> bool + 'static,
     S: FnMut(&mut CB, &K, &V, BatchVal<'_, Tr>, &Tr::Time, &R, &mut Vec<(Tr::Time, BatchDiff<Tr>)>) + 'static,
     CB: ContainerBuilder,
 {
@@ -176,7 +176,7 @@ where
 
             // Local variables to track if and when we should exit early.
             let mut yielded = false;
-            let timer = std::time::Instant::now();
+            let timer = web_time::Instant::now();
             let mut work = 0;
 
             if let Some(ref mut trace) = arrangement_trace {

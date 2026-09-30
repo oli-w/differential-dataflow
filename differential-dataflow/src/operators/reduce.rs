@@ -10,6 +10,7 @@
 //! account of which times suffice lives in `formal/Differential/Coverage.lean`.
 
 use crate::Data;
+use crate::lattice::Lattice;
 
 use std::marker::PhantomData;
 
@@ -105,6 +106,25 @@ where
     reduce_with_tactic(trace, name, cursors::CursorTactic::<Tr1::Batch, Tr2::Batch, Bu, L, P>::new(logic, push))
 }
 
+/// Like [`reduce_trace`], with optional bootstrap output injection.
+///
+/// See [`reduce_with_tactic_with_bootstrap`] for the semantics of `bootstrap_frontier` and
+/// `bootstrap_output_batches`.
+pub fn reduce_trace_with_bootstrap<'scope, Tr1, Bu, Tr2, KC, L, P>(trace: Arranged<'scope, Tr1>, bootstrap_frontier: Antichain<Tr1::Time>, bootstrap_output_batches: Vec<Tr2::Batch>, name: &str, logic: L, push: P) -> Arranged<'scope, TraceAgent<Tr2>>
+where
+    Tr1: TraceReader<Batch: Navigable> + 'static,
+    Tr2: Trace<Batch: Navigable, Time = Tr1::Time> + 'static,
+    KC: BatchContainer,
+    BatchCursor<Tr1>: Cursor<Time = Tr1::Time, KeyContainer = KC>,
+    for<'a> BatchCursor<Tr1>: Cursor<Key<'a> = KC::ReadItem<'a>>,
+    for<'a> BatchCursor<Tr2>: Cursor<Key<'a> = KC::ReadItem<'a>, ValOwn: Data, Time = Tr2::Time>,
+    Bu: Builder<Time=Tr2::Time, Output = Tr2::Batch, Input: Default> + 'static,
+    L: FnMut(KC::ReadItem<'_>, &[(BatchVal<'_, Tr1>, BatchDiff<Tr1>)], &mut Vec<(BatchValOwn<Tr2>, BatchDiff<Tr2>)>, &mut Vec<(BatchValOwn<Tr2>, BatchDiff<Tr2>)>)+'static,
+    P: FnMut(&mut Bu::Input, KC::ReadItem<'_>, &mut Vec<(BatchValOwn<Tr2>, Tr2::Time, BatchDiff<Tr2>)>) + 'static,
+{
+    reduce_with_tactic_with_bootstrap(trace, bootstrap_frontier, bootstrap_output_batches, name, cursors::CursorTactic::<Tr1::Batch, Tr2::Batch, Bu, L, P>::new(logic, push))
+}
+
 // The model-derived reference tactic and its entry point live in `mod reference`; re-exported here
 // (doc-hidden) as the sole public handle for its differential and oracle tests.
 #[doc(hidden)]
@@ -117,7 +137,27 @@ pub use reference::reduce_trace_reference;
 /// `TraceReader` of its input and `Trace` of its output, never `Navigable`: it extracts batches via
 /// `batches_through`, and building cursors over them (if that is how the reduce proceeds) is the
 /// tactic's concern.
-pub fn reduce_with_tactic<'scope, Tr1, Tr2, T>(trace: Arranged<'scope, Tr1>, name: &str, mut tactic: T) -> Arranged<'scope, TraceAgent<Tr2>>
+pub fn reduce_with_tactic<'scope, Tr1, Tr2, T>(trace: Arranged<'scope, Tr1>, name: &str, tactic: T) -> Arranged<'scope, TraceAgent<Tr2>>
+where
+    Tr1: TraceReader + 'static,
+    Tr2: Trace<Time = Tr1::Time> + 'static,
+    T: ReduceTactic<Tr1::Batch, Tr2::Batch> + 'static,
+{
+    reduce_with_tactic_with_bootstrap(trace, Antichain::new(), Vec::new(), name, tactic)
+}
+
+/// Like [`reduce_with_tactic`], with pre-built bootstrap output batches.
+///
+/// When `bootstrap_frontier` is non-empty, the output batches are inserted directly into the output
+/// trace in order (each batch's `lower` must equal the previous batch's `upper`, starting at
+/// `T::minimum()`), and the operator starts retiring work from `bootstrap_frontier` joined with the
+/// batches' combined upper, rather than from the minimum. The pre-injected batches already cover the
+/// earlier range, so the first activation does no re-evaluation, and later input is reduced relative
+/// to the pre-injected output.
+///
+/// When `bootstrap_frontier` is empty and `bootstrap_output_batches` is empty, this is identical to
+/// [`reduce_with_tactic`].
+pub fn reduce_with_tactic_with_bootstrap<'scope, Tr1, Tr2, T>(trace: Arranged<'scope, Tr1>, bootstrap_frontier: Antichain<Tr1::Time>, bootstrap_output_batches: Vec<Tr2::Batch>, name: &str, mut tactic: T) -> Arranged<'scope, TraceAgent<Tr2>>
 where
     Tr1: TraceReader + 'static,
     Tr2: Trace<Time = Tr1::Time> + 'static,
@@ -145,14 +185,44 @@ where
 
             let (mut output_reader, mut output_writer) = TraceAgent::new(empty, operator_info, logger);
 
+            // Inject the bootstrap output batches directly into the output trace, in order.
+            // Empty-range batches (`lower == upper`) are skipped for insertion but still contribute
+            // their upper to the running frontier, so callers can pass a single sealed empty-range
+            // batch as a "no bootstrap data" sentinel without tripping `TraceWriter::insert`.
+            let bootstrap_output_upper = {
+                let mut running_upper = Antichain::from_elem(<Tr1::Time as Timestamp>::minimum());
+                for bootstrap_batch in bootstrap_output_batches {
+                    assert!(
+                        bootstrap_batch.description().lower() == &running_upper,
+                        "bootstrap batch lower {:?} must equal running upper {:?}",
+                        bootstrap_batch.description().lower(),
+                        running_upper,
+                    );
+                    running_upper = bootstrap_batch.description().upper().clone();
+                    if bootstrap_batch.description().lower() != bootstrap_batch.description().upper() {
+                        output_writer.insert(bootstrap_batch, Some(<Tr1::Time as Timestamp>::minimum()));
+                    }
+                }
+                running_upper
+            };
+
             *result_trace = Some(output_reader.clone());
 
             // Capabilities for the lower envelope of the interesting times the operator holds.
             let mut capabilities = CapabilitySet::<Tr1::Time>::default();
 
+            // The reduce must start at least as far as both the caller's declared skip range and
+            // where the output writer actually is, so it never produces output behind the writer.
+            let effective_start = if bootstrap_frontier.is_empty() {
+                Antichain::from_elem(<Tr1::Time as Timestamp>::minimum())
+            } else {
+                bootstrap_frontier.join(&bootstrap_output_upper)
+            };
+            output_writer.seal(effective_start.clone());
+
             // Upper and lower frontiers for the pending input and output batches to process.
-            let mut upper_limit = Antichain::from_elem(<Tr1::Time as Timestamp>::minimum());
-            let mut lower_limit = Antichain::from_elem(<Tr1::Time as Timestamp>::minimum());
+            let mut upper_limit = effective_start.clone();
+            let mut lower_limit = effective_start;
 
             move |(input, frontier), output| {
 

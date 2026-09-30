@@ -74,13 +74,48 @@ where
     join_with_tactic(arranged1, arranged2, cursors::CursorTactic::<Tr1::Batch, Tr2::Batch, _, CB>::new(result))
 }
 
+/// Like [`join_traces`], but skips start-up work for the pre-injected bootstrap portion of `arranged2`.
+///
+/// See [`join_with_tactic_with_bootstrap`] for the semantics of `bootstrap_frontier`.
+pub fn join_traces_with_bootstrap<'scope, Tr1, Tr2, KC, L, CB>(arranged1: Arranged<'scope, Tr1>, arranged2: Arranged<'scope, Tr2>, bootstrap_frontier: timely::progress::frontier::Antichain<Tr1::Time>, result: L) -> Stream<'scope, Tr1::Time, CB::Container>
+where
+    Tr1: TraceReader<Batch: Navigable>+'static,
+    Tr2: TraceReader<Batch: Navigable, Time = Tr1::Time>+'static,
+    KC: BatchContainer,
+    BatchCursor<Tr1>: Cursor<Time = Tr1::Time, KeyContainer = KC>,
+    for<'a> BatchCursor<Tr1>: Cursor<Key<'a> = KC::ReadItem<'a>>,
+    for<'a> BatchCursor<Tr2>: Cursor<Key<'a> = KC::ReadItem<'a>, Time = Tr1::Time>,
+    L: FnMut(KC::ReadItem<'_>,BatchVal<'_, Tr1>,BatchVal<'_, Tr2>,Tr1::Time,&BatchDiff<Tr1>,&BatchDiff<Tr2>,&mut CB)+'static,
+    CB: ContainerBuilder<Container: Default> + 'static,
+{
+    join_with_tactic_with_bootstrap(arranged1, arranged2, bootstrap_frontier, cursors::CursorTactic::<Tr1::Batch, Tr2::Batch, _, CB>::new(result))
+}
+
 /// Drives an equijoin of two traces using a supplied [`JoinTactic`].
 ///
 /// This is the general join operator: it does the dataflow plumbing (frontiers, capabilities, trace
 /// compaction) and routes the per-batch work through the tactic. It requires only `TraceReader` of its
 /// inputs, never `Navigable`: it extracts trace batches via `batches_through`, and building cursors over
 /// them (if that is how the join proceeds) is the tactic's concern.
-pub fn join_with_tactic<'scope, Tr1, Tr2, T, C>(arranged1: Arranged<'scope, Tr1>, arranged2: Arranged<'scope, Tr2>, mut tactic: T) -> Stream<'scope, Tr1::Time, C>
+pub fn join_with_tactic<'scope, Tr1, Tr2, T, C>(arranged1: Arranged<'scope, Tr1>, arranged2: Arranged<'scope, Tr2>, tactic: T) -> Stream<'scope, Tr1::Time, C>
+where
+    Tr1: TraceReader+'static,
+    Tr2: TraceReader<Time = Tr1::Time>+'static,
+    T: JoinTactic<Tr1::Batch, Tr2::Batch, C>+'static,
+    C: Container + 'static,
+{
+    join_with_tactic_with_bootstrap(arranged1, arranged2, timely::progress::frontier::Antichain::new(), tactic)
+}
+
+/// Like [`join_with_tactic`], for a second input whose trace was partly populated by pre-built bootstrap batches.
+///
+/// In the start-up loop over `arranged2`'s trace, any batch whose `upper` is `<=` `bootstrap_frontier`
+/// is not joined against `arranged1`'s trace (so the bootstrap x bootstrap cross-join is not emitted on
+/// the output stream), while `acknowledged2` still advances past it. Batches of `arranged2` that arrive
+/// later still join against the full `arranged1` trace, including its bootstrap data.
+///
+/// When `bootstrap_frontier` is empty the filter is disabled, and this is identical to [`join_with_tactic`].
+pub fn join_with_tactic_with_bootstrap<'scope, Tr1, Tr2, T, C>(arranged1: Arranged<'scope, Tr1>, arranged2: Arranged<'scope, Tr2>, bootstrap_frontier: timely::progress::frontier::Antichain<Tr1::Time>, mut tactic: T) -> Stream<'scope, Tr1::Time, C>
 where
     Tr1: TraceReader+'static,
     Tr2: TraceReader<Time = Tr1::Time>+'static,
@@ -138,9 +173,16 @@ where
         // We capture batch2's batches first and establish work second to avoid taking a `RefCell` lock
         // on both traces at the same time, as they could be the same trace and this would panic.
         let mut batch2_list = Vec::new();
+        // An empty `bootstrap_frontier` disables the filter: `less_equal(x, empty)` is vacuously true
+        // in the antichain order, so without this guard every batch would be classed as bootstrap.
+        let bootstrap_filter_active = !bootstrap_frontier.is_empty();
         trace2.map_batches(|batch2| {
             acknowledged2.clone_from(batch2.upper());
-            batch2_list.push(batch2.clone());
+            let is_bootstrap_batch = bootstrap_filter_active
+                && PartialOrder::less_equal(batch2.upper(), &bootstrap_frontier);
+            if !is_bootstrap_batch {
+                batch2_list.push(batch2.clone());
+            }
         });
         // At this point, `ack2` should exactly equal `trace2.read_upper()`, as they are both determined by
         // iterating through batches and capturing the upper bound. This is a great moment to assert that

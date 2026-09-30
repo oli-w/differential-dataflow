@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 use std::ops::Mul;
-use std::time::Instant;
+use web_time::Instant;
 
 use timely::ContainerBuilder;
 use timely::container::CapacityContainerBuilder;
@@ -157,7 +157,7 @@ where
     <BatchCursor<Tr> as Cursor>::KeyContainer: BatchContainer<Owned=K>,
     FF: Fn(&Tr::Time, &mut Antichain<Tr::Time>) + 'static,
     CF: Fn(BatchTimeGat<'_, Tr>, &Tr::Time) -> bool + 'static,
-    Y: Fn(std::time::Instant, usize) -> bool + 'static,
+    Y: Fn(web_time::Instant, usize) -> bool + 'static,
     S: FnMut(&mut SessionFor<Tr::Time, CB>, &K, &V, BatchVal<'_, Tr>, &Tr::Time, &R, &mut Vec<(Tr::Time, BatchDiff<Tr>)>) + 'static,
     CB: ContainerBuilder,
 {
@@ -197,7 +197,7 @@ where
             // stopping at any point. We clean up all of the zeros in buffers that did any work,
             // and reactivate at the end if the yield function still says so.
             let mut yielded = false;
-            let timer = std::time::Instant::now();
+            let timer = web_time::Instant::now();
             let mut work = 0;
 
             // New entries to introduce to the stash after processing.

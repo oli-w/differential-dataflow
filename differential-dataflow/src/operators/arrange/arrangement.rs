@@ -259,6 +259,48 @@ impl<'scope, Tr1: TraceReader<Batch: Navigable>+'static> Arranged<'scope, Tr1> {
         )
             .as_collection()
     }
+
+    /// Bootstrap-aware variant of [`Arranged::join_core`].
+    ///
+    /// `bootstrap_frontier` describes the portion of `other`'s trace that was pre-populated via
+    /// pre-built bootstrap batches (e.g. through `arrange_with_bootstrap`). Batches of `other`
+    /// whose `upper` is `<=` `bootstrap_frontier` are skipped during the operator's start-up loop,
+    /// so the bootstrap x bootstrap cross-join is NOT emitted on the output stream. Runtime deltas
+    /// still read the full trace (including bootstrap), so incremental joins against bootstrap
+    /// data remain correct.
+    ///
+    /// When `bootstrap_frontier.is_empty()` the filter is disabled and this behaves identically
+    /// to [`Arranged::join_core`].
+    pub fn join_core_with_bootstrap<Tr2,I,L,R1,R2,KC>(self, other: Arranged<'scope, Tr2>, bootstrap_frontier: Antichain<Tr1::Time>, mut result: L) -> VecCollection<'scope, Tr1::Time,I::Item,<R1 as Multiply<R2>>::Output>
+    where
+        Tr2: TraceReader<Batch: Navigable, Time=Tr1::Time>+Clone+'static,
+        BatchCursor<Tr1>: Cursor<Diff = R1, Time = Tr1::Time, KeyContainer = KC>,
+        BatchCursor<Tr2>: Cursor<Diff = R2, Time = Tr1::Time>,
+        KC: BatchContainer,
+        for<'a> BatchCursor<Tr1>: Cursor<Key<'a> = KC::ReadItem<'a>>,
+        for<'a> BatchCursor<Tr2>: Cursor<Key<'a> = KC::ReadItem<'a>>,
+        R1: Multiply<R2, Output: Semigroup+'static> + Clone,
+        I: IntoIterator<Item: Data>,
+        L: FnMut(KC::ReadItem<'_>,BatchVal<'_, Tr1>,BatchVal<'_, Tr2>)->I+'static
+    {
+        let mut result = move |k: KC::ReadItem<'_>, v1: BatchVal<'_, Tr1>, v2: BatchVal<'_, Tr2>, t: Tr1::Time, r1: &R1, r2: &R2| {
+            let r = (r1.clone()).multiply(r2);
+            result(k, v1, v2).into_iter().map(move |d| (d, t.clone(), r.clone()))
+        };
+
+        use crate::operators::join::join_traces_with_bootstrap;
+        join_traces_with_bootstrap::<_, _, _, _, crate::consolidation::ConsolidatingContainerBuilder<_>>(
+            self,
+            other,
+            bootstrap_frontier,
+            move |k, v1, v2, t, d1, d2, c| {
+                for datum in result(k, v1, v2, t, d1, d2) {
+                    c.push_into(datum);
+                }
+            }
+        )
+            .as_collection()
+    }
 }
 
 // Direct reduce implementations.
@@ -300,6 +342,48 @@ impl<'scope, Tr1: TraceReader<Batch: Navigable>+'static> Arranged<'scope, Tr1> {
     {
         use crate::operators::reduce::reduce_trace;
         reduce_trace::<_,Bu,_,KC,_,_>(self, name, logic, push)
+    }
+
+    /// Like [`Arranged::reduce_abelian`], but accepts pre-built bootstrap output batches and frontier.
+    ///
+    /// When `bootstrap_frontier` is non-empty, the output batches are inserted directly into the output
+    /// trace in lower-bound order and the operator skips re-evaluation for `[T::minimum(), bootstrap_frontier)`.
+    /// Each batch's `lower` must equal the previous batch's `upper` (contiguous, non-overlapping).
+    /// When both are empty, behaves identically to `reduce_abelian`.
+    pub fn reduce_abelian_with_bootstrap<L, Bu, Tr2, KC, P>(self, bootstrap_frontier: Antichain<Tr1::Time>, bootstrap_output_batches: Vec<Tr2::Batch>, name: &str, mut logic: L, push: P) -> Arranged<'scope, TraceAgent<Tr2>>
+    where
+        Tr2: Trace<Batch: Navigable, Time=Tr1::Time>+'static,
+        KC: BatchContainer,
+        BatchCursor<Tr1>: Cursor<Time = Tr1::Time, KeyContainer = KC>,
+        for<'a> BatchCursor<Tr1>: Cursor<Key<'a> = KC::ReadItem<'a>>,
+        for<'a> BatchCursor<Tr2>: Cursor<Key<'a> = KC::ReadItem<'a>, ValOwn: Data, Time = Tr2::Time, Diff: Abelian>,
+        Bu: Builder<Time=Tr1::Time, Output = Tr2::Batch, Input: Default> + 'static,
+        L: FnMut(KC::ReadItem<'_>, &[(BatchVal<'_, Tr1>, BatchDiff<Tr1>)], &mut Vec<(BatchValOwn<Tr2>, BatchDiff<Tr2>)>)+'static,
+        P: FnMut(&mut Bu::Input, KC::ReadItem<'_>, &mut Vec<(BatchValOwn<Tr2>, Tr2::Time, BatchDiff<Tr2>)>) + 'static,
+    {
+        self.reduce_core_with_bootstrap::<_,Bu,Tr2,KC,_>(bootstrap_frontier, bootstrap_output_batches, name, move |key, input, output, change| {
+            if !input.is_empty() {
+                logic(key, input, change);
+            }
+            change.extend(output.drain(..).map(|(x,mut d)| { d.negate(); (x, d) }));
+            crate::consolidation::consolidate(change);
+        }, push)
+    }
+
+    /// Like [`Arranged::reduce_core`], but accepts pre-built bootstrap output batches and frontier.
+    pub fn reduce_core_with_bootstrap<L, Bu, Tr2, KC, P>(self, bootstrap_frontier: Antichain<Tr1::Time>, bootstrap_output_batches: Vec<Tr2::Batch>, name: &str, logic: L, push: P) -> Arranged<'scope, TraceAgent<Tr2>>
+    where
+        Tr2: Trace<Batch: Navigable, Time=Tr1::Time>+'static,
+        KC: BatchContainer,
+        BatchCursor<Tr1>: Cursor<Time = Tr1::Time, KeyContainer = KC>,
+        for<'a> BatchCursor<Tr1>: Cursor<Key<'a> = KC::ReadItem<'a>>,
+        for<'a> BatchCursor<Tr2>: Cursor<Key<'a> = KC::ReadItem<'a>, ValOwn: Data, Time = Tr2::Time>,
+        Bu: Builder<Time=Tr1::Time, Output = Tr2::Batch, Input: Default> + 'static,
+        L: FnMut(KC::ReadItem<'_>, &[(BatchVal<'_, Tr1>, BatchDiff<Tr1>)], &mut Vec<(BatchValOwn<Tr2>, BatchDiff<Tr2>)>, &mut Vec<(BatchValOwn<Tr2>, BatchDiff<Tr2>)>)+'static,
+        P: FnMut(&mut Bu::Input, KC::ReadItem<'_>, &mut Vec<(BatchValOwn<Tr2>, Tr2::Time, BatchDiff<Tr2>)>) + 'static,
+    {
+        use crate::operators::reduce::reduce_trace_with_bootstrap;
+        reduce_trace_with_bootstrap::<_,Bu,_,KC,_,_>(self, bootstrap_frontier, bootstrap_output_batches, name, logic, push)
     }
 }
 
